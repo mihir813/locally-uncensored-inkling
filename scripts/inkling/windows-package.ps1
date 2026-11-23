@@ -4,8 +4,7 @@
 # Writes everything a release needs into -OutDir.
 param(
   [Parameter(Mandatory = $true)][string]$OutDir,
-  [string]$BundleDir = 'src-tauri\target\release\bundle',
-  [string]$InstallDir = 'C:\LU-Install\Locally Uncensored'
+  [string]$BundleDir = 'src-tauri\target\release\bundle'
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -35,10 +34,16 @@ Add-Content $log "| Step | Result | Detail |`n|---|---|---|"
 Copy-Item $setup.FullName $OutDir
 if ($msi) { Copy-Item $msi.FullName $OutDir }
 
-# --- silent install into a clean folder --------------------------------------
-if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
-$p = Start-Process -FilePath $setup.FullName -ArgumentList '/S', "/D=$InstallDir" -Wait -PassThru
-Step 'Silent install (NSIS /S)' ($p.ExitCode -eq 0 -and (Test-Path $InstallDir)) "exit code $($p.ExitCode), folder $InstallDir"
+# --- silent install (NSIS chooses the folder; /D is ignored in this install mode) ---
+$p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+$InstallDir = ''
+try { $InstallDir = (& "$PSScriptRoot\find-install.ps1" | Select-Object -Last 1) } catch { Write-Host $_ }
+Step 'Silent install (NSIS /S)' ($p.ExitCode -eq 0 -and $InstallDir -ne '') "exit code $($p.ExitCode), folder $InstallDir"
+if (-not $InstallDir) {
+  Add-Content $log "`nOverall: **FAIL**"
+  Get-Content $log | Add-Content $env:GITHUB_STEP_SUMMARY
+  exit 1
+}
 
 $exe = Get-ChildItem $InstallDir -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(lu-llama|uninstall)' } | Select-Object -First 1
 Step 'Main program installed' ($null -ne $exe) "$($exe.Name)"
@@ -122,6 +127,9 @@ Get-ChildItem $InstallDir -Recurse -File | Sort-Object FullName | ForEach-Object
 $u = Start-Process -FilePath (Join-Path $InstallDir 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru
 Start-Sleep -Seconds 8
 $leftFiles = if (Test-Path $InstallDir) { @(Get-ChildItem $InstallDir -Recurse -File).Count } else { 0 }
+$stillListed = $true
+try { & "$PSScriptRoot\find-install.ps1" | Out-Null } catch { $stillListed = $false }
+Step 'Silent uninstall removes the uninstall entry' (-not $stillListed) ''
 Step 'Silent uninstall removes the program' ($u.ExitCode -eq 0 -and -not (Test-Path (Join-Path $InstallDir $exe.Name)) -and -not (Test-Path $server)) "exit code $($u.ExitCode), $leftFiles file(s) left in the folder"
 
 Add-Content $log "`nOverall: **$(if ($failed) { 'FAIL' } else { 'PASS' })**"
