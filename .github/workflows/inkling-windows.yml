@@ -251,7 +251,11 @@ jobs:
           set -euo pipefail
           tag="inkling-build-${{ github.run_number }}"
           mkdir -p assets
-          find dist/inkling-windows-build -maxdepth 1 -type f -exec cp {} assets/ \;
+          # GitHub turns a space in an asset name into a dot. Do it here, so the names in SHA256SUMS.txt are the published ones.
+          find dist/inkling-windows-build -maxdepth 1 -type f | while IFS= read -r f; do
+            name="$(basename "$f")"
+            cp "$f" "assets/${name// /.}"
+          done
           if [ -d dist/inkling-windows-model-test ]; then
             (cd dist/inkling-windows-model-test && zip -qr ../../assets/windows-test-reports.zip .)
           fi
