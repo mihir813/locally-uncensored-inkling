@@ -176,10 +176,10 @@ jobs:
         run: |
           $setup = Get-ChildItem "$env:RUNNER_TEMP\inkling-out" -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw "no installer in the build artifact" }
-          $dir = 'C:\LU-Test\Locally Uncensored'
-          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
-          if (-not (Test-Path "$dir\lu-llama-server.exe")) { throw "lu-llama-server.exe is not in $dir" }
+          $dir = ./scripts/inkling/find-install.ps1 | Select-Object -Last 1
+          Write-Host "Installed into $dir"
           Add-Content $env:GITHUB_ENV "LU_DIR=$dir"
           Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
           Get-CimInstance Win32_ComputerSystem | Select-Object @{n='RAM GiB';e={[math]::Round($_.TotalPhysicalMemory/1GB,1)}} | Format-List
