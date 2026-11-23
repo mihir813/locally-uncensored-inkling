@@ -231,7 +231,8 @@ jobs:
   publish:
     name: Publish the pre-release
     needs: [build, model-test]
-    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    # A pull request from a fork gets a read-only token and cannot create a release.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
