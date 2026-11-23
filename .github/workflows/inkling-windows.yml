@@ -1,0 +1,277 @@
+name: Inkling Windows build
+
+# Builds the Windows installer and a portable ZIP from this branch, installs the
+# installer on the runner, starts the app, loads the exact Inkling 2 Mini file
+# through the bundled engine and publishes everything as a pre-release.
+# Nothing is code signed. No model weights go into the installer or the ZIP.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: inkling-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SIDECAR_TRIPLE: x86_64-pc-windows-msvc
+  # Same pins as release.yml.
+  # windows-latest defaults to MSVC 14.52, which verify-sidecar-isa.sh refuses.
+  LLAMA_MSVC_TOOLSET: 'v143,version=14.44'
+  VULKAN_SDK_VERSION: '1.4.357.0'
+  VULKAN_SDK_SHA256: '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d'
+  STORIES260K_REVISION: '499bc8821c6b12b4e53c5bffcb21ec206f212d81'
+  STORIES260K_SHA256: '270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d'
+  # The file this build is for, pinned by revision and SHA-256.
+  INKLING_REPO: 'Abiray/Inkling-2-Mini-Uncensored-GGUF'
+  INKLING_REVISION: '4f86d37974746901ab40a9a34bcd309ca64a4c83'
+  INKLING_FILE: 'Inkling-2-Mini-Uncensored-IQ4_NL.gguf'
+  INKLING_SHA256: 'e6680ab9f97c4aadee065273ec063124d543c66708c0a7d64849c424c3dbdace'
+
+jobs:
+  build:
+    name: Build installer and portable ZIP
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Sidecar build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: D:/lb
+          key: llama-${{ hashFiles('scripts/build-llama.sh', 'scripts/llama-patches/**') }}-${{ env.SIDECAR_TRIPLE }}-v1
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          curl.exe -fL --retry 3 -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" `
+            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed" }
+          $got = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP\VulkanSDK-Installer.exe").Hash.ToLower()
+          if ($got -ne $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK installer has sha256 $got, expected $env:VULKAN_SDK_SHA256. It was not run." }
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+
+      - name: Build llama-server sidecar
+        shell: bash
+        env:
+          BUILD_JOBS: 2
+          LLAMA_BUILD_CACHE: D:/lb
+        run: bash scripts/build-llama.sh "$SIDECAR_TRIPLE"
+
+      - name: Assert sidecar exists
+        shell: bash
+        run: |
+          test -f "src-tauri/bin/lu-llama-server-$SIDECAR_TRIPLE.exe"
+          test -f "src-tauri/bin/lu-llama-cvector-generator-$SIDECAR_TRIPLE.exe"
+          ls -la src-tauri/bin/ "src-tauri/resources/llama/$SIDECAR_TRIPLE/"
+
+      - name: "Boot-smoke: small model load plus /health"
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $bin = (Resolve-Path "src-tauri\bin\lu-llama-server-$env:SIDECAR_TRIPLE.exe").Path
+          $runDir = (Resolve-Path "src-tauri\resources\llama\$env:SIDECAR_TRIPLE").Path
+          Push-Location $runDir
+          & $bin --version
+          & $bin --list-devices
+          if ($LASTEXITCODE -ne 0) { throw "llama-server --list-devices exited $LASTEXITCODE" }
+          Pop-Location
+          $model = "$env:RUNNER_TEMP\stories260K.gguf"
+          curl.exe -fsSL --retry 3 --max-time 60 -o $model "https://huggingface.co/ggml-org/models/resolve/$env:STORIES260K_REVISION/tinyllamas/stories260K.gguf"
+          if ($LASTEXITCODE -ne 0) { throw "smoke model download failed" }
+          $actualHash = (Get-FileHash -Path $model -Algorithm SHA256).Hash
+          if ($actualHash.ToLower() -ne $env:STORIES260K_SHA256.ToLower()) { throw "stories260K.gguf did not match the pinned sha256" }
+          $proc = Start-Process -FilePath $bin -ArgumentList "--host","127.0.0.1","--port","8129","-m",$model -WorkingDirectory $runDir -PassThru -NoNewWindow
+          $ok = $false
+          foreach ($i in 1..40) {
+            Start-Sleep -Milliseconds 400
+            try { Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8129/health" -TimeoutSec 2 | Out-Null; $ok = $true; break } catch { }
+          }
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "llama-server /health never came up" }
+          Write-Host "OK - sidecar boots from the resource layout, loads a model and answers /health"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Tauri build (unsigned)
+        shell: bash
+        run: bash scripts/ci-tauri-build.sh
+
+      # After the Tauri build on purpose: this step puts the MSVC tools into the
+      # environment, and Git Bash then finds its own /usr/bin/link before
+      # link.exe, which breaks every Rust link in a `shell: bash` step.
+      - name: Set up MSVC dev tools (dumpbin, for the ISA guard)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Verify sidecar ISA layout
+        shell: bash
+        env:
+          LLAMA_BUILD_CACHE: D:/lb
+        run: bash scripts/verify-sidecar-isa.sh "$SIDECAR_TRIPLE"
+
+      - name: Install, start and uninstall the built installer; make the portable ZIP
+        shell: pwsh
+        timeout-minutes: 30
+        run: ./scripts/inkling/windows-package.ps1 -OutDir "$env:RUNNER_TEMP\inkling-out"
+
+      - name: Keep the build as a workflow artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inkling-windows-build
+          path: ${{ runner.temp }}/inkling-out
+          if-no-files-found: error
+          retention-days: 14
+
+  model-test:
+    name: Load the exact model on Windows (CPU)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Fetch the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: inkling-windows-build
+          path: ${{ runner.temp }}/inkling-out
+
+      - name: Install the app from the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem "$env:RUNNER_TEMP\inkling-out" -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw "no installer in the build artifact" }
+          $dir = 'C:\LU-Test\Locally Uncensored'
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+          if (-not (Test-Path "$dir\lu-llama-server.exe")) { throw "lu-llama-server.exe is not in $dir" }
+          Add-Content $env:GITHUB_ENV "LU_DIR=$dir"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          Get-CimInstance Win32_ComputerSystem | Select-Object @{n='RAM GiB';e={[math]::Round($_.TotalPhysicalMemory/1GB,1)}} | Format-List
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber | Format-List
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='Free GiB';e={[math]::Round($_.Free/1GB,1)}}
+
+      - name: Download the exact model (13.9 GiB, pinned)
+        shell: pwsh
+        timeout-minutes: 40
+        run: |
+          New-Item -ItemType Directory -Force 'C:\LU-Test\models' | Out-Null
+          $model = "C:\LU-Test\models\$env:INKLING_FILE"
+          curl.exe -fL --retry 5 --retry-all-errors -C - -o $model "https://huggingface.co/$env:INKLING_REPO/resolve/$env:INKLING_REVISION/$env:INKLING_FILE"
+          if ($LASTEXITCODE -ne 0) { throw "model download failed" }
+          $got = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLower()
+          if ($got -ne $env:INKLING_SHA256) { throw "model has sha256 $got, expected $env:INKLING_SHA256" }
+          Write-Host "OK - $env:INKLING_FILE, $((Get-Item $model).Length) bytes, sha256 $got"
+          Add-Content $env:GITHUB_ENV "INKLING_MODEL=$model"
+
+      - name: "Engine test: load, stream, second turn, Stop, unload, reload"
+        shell: pwsh
+        timeout-minutes: 80
+        run: |
+          node scripts/inkling/model-test.mjs --server "$env:LU_DIR\lu-llama-server.exe" --cwd "$env:LU_DIR" `
+            --model "$env:INKLING_MODEL" --out "$env:RUNNER_TEMP\inkling-test\engine" --ngl 0 --max-tokens 96 `
+            --label "GitHub Actions windows-latest runner, installed lu-llama-server.exe, CPU only (-ngl 0)"
+          $code = $LASTEXITCODE
+          Get-Content "$env:RUNNER_TEMP\inkling-test\engine\model-test.md" | Add-Content $env:GITHUB_STEP_SUMMARY
+          exit $code
+
+      - name: "App test: the installed app starts its engine on the model"
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        timeout-minutes: 45
+        run: |
+          npm ci --ignore-scripts
+          $exe = Get-ChildItem "$env:LU_DIR" -Filter '*.exe' | Where-Object { $_.Name -notmatch '^(lu-llama|uninstall)' } | Select-Object -First 1
+          node scripts/inkling/app-smoke.mjs --exe $exe.FullName --model "$env:INKLING_MODEL" --out "$env:RUNNER_TEMP\inkling-test\app"
+          $code = $LASTEXITCODE
+          Get-Content "$env:RUNNER_TEMP\inkling-test\app\app-smoke.md" | Add-Content $env:GITHUB_STEP_SUMMARY
+          exit $code
+
+      - name: Keep the test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inkling-windows-model-test
+          path: ${{ runner.temp }}/inkling-test
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    name: Publish the pre-release
+    needs: [build, model-test]
+    # A pull request from a fork gets a read-only token and cannot create a release.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch the build and the reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          MODEL_TEST: ${{ needs.model-test.result }}
+        run: |
+          set -euo pipefail
+          tag="inkling-build-${{ github.run_number }}"
+          mkdir -p assets
+          # GitHub turns a space in an asset name into a dot. Do it here, so the names in SHA256SUMS.txt are the published ones.
+          find dist/inkling-windows-build -maxdepth 1 -type f | while IFS= read -r f; do
+            name="$(basename "$f")"
+            cp "$f" "assets/${name// /.}"
+          done
+          if [ -d dist/inkling-windows-model-test ]; then
+            (cd dist/inkling-windows-model-test && zip -qr ../../assets/windows-test-reports.zip .)
+          fi
+          (cd assets && sha256sum * > SHA256SUMS.txt)
+          {
+            echo "Locally Uncensored 3.1.3 with llama.cpp b12653, built by GitHub Actions from commit ${HEAD_SHA}."
+            echo
+            echo "- Installer: the file ending in \`_x64-setup.exe\`. Portable: the \`-portable.zip\`."
+            echo "- Not code signed: Windows SmartScreen asks once (More info, Run anyway)."
+            echo "- No model weights inside. Real-model test on the Windows runner: **${MODEL_TEST}** (see windows-test-reports.zip)."
+            echo "- Source: the \"Source code\" archives below are this exact commit."
+          } > notes.md
+          gh release create "$tag" assets/* --repo "$GITHUB_REPOSITORY" --target "$HEAD_SHA" --prerelease \
+            --title "Locally Uncensored 3.1.3 + Inkling 2 Mini engine (build ${{ github.run_number }})" --notes-file notes.md
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
