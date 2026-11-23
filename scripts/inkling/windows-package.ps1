@@ -23,6 +23,7 @@ $msi = Get-ChildItem (Join-Path $BundleDir 'msi') -Filter '*.msi' -ErrorAction S
 if (-not $setup) { throw "no NSIS installer under $BundleDir\nsis" }
 $version = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
 $llamaTag = (Select-String -Path 'scripts\build-llama.sh' -Pattern '^LLAMA_TAG="\$\{LLAMA_TAG:-(b\d+)\}"').Matches[0].Groups[1].Value
+$llamaCommit = (Select-String -Path 'scripts\build-llama.sh' -Pattern '^LLAMA_COMMIT="\$\{LLAMA_COMMIT:-([0-9a-f]{40})\}"').Matches[0].Groups[1].Value
 $os = Get-CimInstance Win32_OperatingSystem
 
 Set-Content $log "# Windows install test`n"
@@ -59,7 +60,8 @@ $verExit = $LASTEXITCODE
 $dev = (& $server --list-devices 2>&1 | Out-String).Trim()
 $devExit = $LASTEXITCODE
 Pop-Location
-Step 'Installed engine starts (--version)' ($verExit -eq 0 -and $ver -match $llamaTag.Substring(1)) (($ver -split "`n")[0])
+# The build number is a commit count, 1 on the depth-1 checkout. The commit identifies the engine.
+Step 'Installed engine starts and is the pinned commit (--version)' ($verExit -eq 0 -and $ver -match $llamaCommit.Substring(0, 7)) (($ver -split "`n")[0])
 Step 'Installed engine lists its devices' ($devExit -eq 0) (($dev -split "`n" | Select-Object -Last 3) -join ' ; ')
 Set-Content (Join-Path $OutDir 'installed-engine-version.txt') "$ver`n`n$dev"
 
