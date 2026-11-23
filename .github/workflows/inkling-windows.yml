@@ -87,17 +87,6 @@ jobs:
           test -f "src-tauri/bin/lu-llama-cvector-generator-$SIDECAR_TRIPLE.exe"
           ls -la src-tauri/bin/ "src-tauri/resources/llama/$SIDECAR_TRIPLE/"
 
-      - name: Set up MSVC dev tools (dumpbin, for the ISA guard)
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        with:
-          arch: x64
-
-      - name: Verify sidecar ISA layout
-        shell: bash
-        env:
-          LLAMA_BUILD_CACHE: D:/lb
-        run: bash scripts/verify-sidecar-isa.sh "$SIDECAR_TRIPLE"
-
       - name: "Boot-smoke: small model load plus /health"
         shell: pwsh
         timeout-minutes: 5
@@ -130,6 +119,20 @@ jobs:
       - name: Tauri build (unsigned)
         shell: bash
         run: bash scripts/ci-tauri-build.sh
+
+      # After the Tauri build on purpose: this step puts the MSVC tools into the
+      # environment, and Git Bash then finds its own /usr/bin/link before
+      # link.exe, which breaks every Rust link in a `shell: bash` step.
+      - name: Set up MSVC dev tools (dumpbin, for the ISA guard)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Verify sidecar ISA layout
+        shell: bash
+        env:
+          LLAMA_BUILD_CACHE: D:/lb
+        run: bash scripts/verify-sidecar-isa.sh "$SIDECAR_TRIPLE"
 
       - name: Install, start and uninstall the built installer; make the portable ZIP
         shell: pwsh
